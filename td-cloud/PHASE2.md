@@ -1,75 +1,96 @@
-﻿# Phase 2 - Deploiement Cloud Run + Pub/Sub
+# Guide TD2 - Phase 3 + 4 (Cloud Tasks + Firestore)
 
-Ce document resume les etapes pour la phase 2.
+Ce guide deploie la version complete:
+- Redis + Pub/Sub (temps reel)
+- Cloud Tasks + Cloud Storage (snapshot async)
+- Firestore (rate limiting + analytics)
 
-## 1. Variables a ajuster
+## 1) Variables cible
 
-- PROJECT_ID: redis-demo-cloud
-- PROJECT_NUMBER: 516582424495
-- REGION: europe-west1
-- TOPIC_NAME: redis-updates
-- SERVICES: instance-1, instance-2
-- REDIS_HOST / REDIS_PORT (Memorystore)
-- VPC_CONNECTOR: vpc-connector
+- `PROJECT_ID`: `td-cloud-495410`
+- `REGION`: `europe-west1`
+- `SERVICES`: `instance-1`, `instance-2`
+- `TOPIC_NAME`: `game-events`
+- `SUB_PREFIX`: `td-redis-sub`
+- `TASK_QUEUE`: `game-events-queue`
+- `SNAPSHOT_BUCKET`: `game-snapshots-<PROJECT_ID>`
 
-## 2. IAM (une seule fois)
+## 2) Provisioning + deploiement via script unique
 
-```powershell
-gcloud projects add-iam-policy-binding redis-demo-cloud --member="serviceAccount:516582424495-compute@developer.gserviceaccount.com" --role="roles/pubsub.publisher"
-gcloud projects add-iam-policy-binding redis-demo-cloud --member="serviceAccount:516582424495-compute@developer.gserviceaccount.com" --role="roles/pubsub.subscriber"
-```
-
-Si tu veux que le code cree topic + subscriptions automatiquement :
+Depuis `td-cloud/`:
 
 ```powershell
-gcloud projects add-iam-policy-binding redis-demo-cloud --member="serviceAccount:516582424495-compute@developer.gserviceaccount.com" --role="roles/pubsub.admin"
+.\deploy.ps1 `
+  -ProjectId td-cloud-495410 `
+  -Region europe-west1 `
+  -RedisHost 10.128.148.43 `
+  -RedisPort 6379 `
+  -VpcConnector vpc-connector `
+  -VpcEgress private-ranges-only `
+  -RateLimitPerMin 5 `
+  -AdminKey td-secret-2026 `
+  -ProvisionInfra `
+  -AllowUnauthenticated
 ```
 
-## 3. Topic Pub/Sub
+Le script fait:
+- activation APIs (`run`, `pubsub`, `cloudtasks`, `storage`, `firestore`, etc.)
+- creation topic + subscriptions
+- creation queue Cloud Tasks
+- creation bucket snapshots
+- creation base Firestore Native (si absente)
+- IAM sur SA Cloud Run (`pubsub`, `cloudtasks.enqueuer`, `datastore.user`, `storage.objectCreator`)
+- deploiement Cloud Run des 2 services
+
+## 3) Tests acceptance
 
 ```powershell
-gcloud pubsub topics describe redis-updates --project=redis-demo-cloud
+$u1 = gcloud run services describe instance-1 --region=europe-west1 --format="value(status.url)"
+$u2 = gcloud run services describe instance-2 --region=europe-west1 --format="value(status.url)"
 ```
 
-Si le topic n'existe pas :
+### Smoke
 
 ```powershell
-gcloud pubsub topics create redis-updates --project=redis-demo-cloud
+Invoke-RestMethod "$u1/health"
+Invoke-RestMethod "$u2/health"
 ```
 
-## 4. Deployer les 2 services
-
-Option simple (commande directe) :
+### Phase 3 - Task + snapshot
 
 ```powershell
-cd "C:\Users\lukas\OneDrive\Bureau\Projet\dev cloud\rediscloud-demo\td-cloud"
-
-gcloud run deploy instance-1 --source . --project=redis-demo-cloud --region=europe-west1 --vpc-connector=vpc-connector --vpc-egress=private-ranges-only --set-env-vars GCP_PROJECT_ID=redis-demo-cloud,TOPIC_NAME=redis-updates,SUBSCRIPTION_NAME=redis-updates-instance-1,REDIS_HOST=10.55.48.211,REDIS_PORT=6379
-
-gcloud run deploy instance-2 --source . --project=redis-demo-cloud --region=europe-west1 --vpc-connector=vpc-connector --vpc-egress=private-ranges-only --set-env-vars GCP_PROJECT_ID=redis-demo-cloud,TOPIC_NAME=redis-updates,SUBSCRIPTION_NAME=redis-updates-instance-2,REDIS_HOST=10.55.48.211,REDIS_PORT=6379
+Invoke-RestMethod -Method Post -Uri "$u1/publish" -ContentType "application/json" -Body '{"message":"phase3-check"}'
+Start-Sleep -Seconds 5
+gcloud storage ls "gs://game-snapshots-td-cloud-495410/snapshots/**"
 ```
 
-Option script (recommande) :
+### Phase 4 - Rate limiting
 
 ```powershell
-cd "C:\Users\lukas\OneDrive\Bureau\Projet\dev cloud\rediscloud-demo\td-cloud"
-./deploy.ps1 -RedisHost 10.55.48.211 -RedisPort 6379 -VpcConnector vpc-connector -VpcEgress private-ranges-only -TimeoutSeconds 3600
+1..7 | ForEach-Object {
+  try {
+    Invoke-RestMethod -Method Post -Uri "$u1/publish" -ContentType "application/json" -Headers @{ "X-Player-ID" = "player-test-42" } -Body "{`"message`":`"hit $_`"}"
+  } catch {
+    $_.Exception.Response.StatusCode.value__
+  }
+}
 ```
 
-Pour rendre les URLs publiques :
+Attendu:
+- 1..5 OK
+- ensuite `429`
+
+### Analytics
 
 ```powershell
-./deploy.ps1 -RedisHost 10.55.48.211 -RedisPort 6379 -VpcConnector vpc-connector -VpcEgress private-ranges-only -TimeoutSeconds 3600 -AllowUnauthenticated
+Invoke-RestMethod -Method Get -Uri "$u1/analytics" -Headers @{ "X-Admin-Key" = "td-secret-2026" }
 ```
 
-Note : si tu veux une subscription par instance Cloud Run (pas par service), ne fournis pas SUBSCRIPTION_NAME.
+## 4) Debug utile
 
-## 5. Test
-
-- Ouvre les 2 URLs Cloud Run.
-- Publie un message dans une des deux pages.
-- Les deux pages doivent recevoir un `update` en temps reel.
-
-## Local
-
-Voir `LOCAL_DEV.md` pour l'emulateur Pub/Sub ou le mode sans Pub/Sub.
+```powershell
+gcloud pubsub subscriptions list --project=td-cloud-495410
+gcloud tasks queues describe game-events-queue --location=europe-west1 --project=td-cloud-495410
+gcloud firestore databases list --project=td-cloud-495410
+gcloud logging read "resource.type=cloud_run_revision AND resource.labels.service_name=instance-1 AND textPayload:process" --project=td-cloud-495410 --limit=30 --format="table(timestamp,textPayload)"
+```

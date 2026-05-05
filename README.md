@@ -1,137 +1,85 @@
-# Redis Pub/Sub Demo (Cloud Run + WebSocket)
+# TD Cloud Run - Redis, Pub/Sub, Cloud Tasks, Firestore
 
-Projet de demo temps reel avec 2 services Cloud Run (`instance-1`, `instance-2`), Redis (Memorystore), Pub/Sub et Socket.IO.
-
-## Objectif
-
-Quand un client publie un message:
-
-1. le serveur ecrit le message dans Redis (`SETEX`)
-2. le serveur publie la cle Redis dans Pub/Sub
-3. chaque instance Cloud Run recoit le message via sa subscription dediee
-4. chaque instance pousse `update` a ses clients WebSocket
-
-Resultat: les 2 pages recoivent la mise a jour sans reload.
+Projet Flask deploye sur Cloud Run avec:
+- synchro temps reel via Redis + Pub/Sub
+- traitement asynchrone via Cloud Tasks + snapshots Cloud Storage
+- rate limiting et analytics via Firestore
 
 ## Stack
 
 - Python 3.12
 - Flask + Flask-SocketIO
-- Gunicorn (`gthread`)
-- Redis (google Memorystore)
-- Google Pub/Sub
+- Redis Memorystore
+- Pub/Sub
+- Cloud Tasks
+- Cloud Storage
+- Firestore
 - Cloud Run
 
-## Arborescence utile
+## Routes
 
-- `main.py`: API Flask + listener Pub/Sub + Socket.IO
-- `static/index.html`: page web
-- `static/app.js`: client Socket.IO + publish + debug live
-- `static/styles.css`: style frontend
-- `deploy.ps1`: deploiement des 2 services Cloud Run
-- `PHASE2.md`: notes phase 2
-- `LOCAL_DEV.md`: notes rapide dev local
-- `DOCUMENTATION.md` / `DOCUMENTATION.pdf`: doc detaillee
+- `POST /publish`: publie un evenement, ecrit dans Redis, envoie Pub/Sub, enqueue une Cloud Task
+- `POST /process`: appelee par Cloud Tasks pour sauvegarder un snapshot JSON dans GCS
+- `GET /data`: etat Redis courant
+- `GET /analytics`: lecture analytics + quotas (header `X-Admin-Key`)
+- `GET /health`: health check Redis
 
-## Prerequis
-
-- `gcloud` installe et configure
-- projet GCP actif (ex: `redis-demo-cloud`)
-- topic Pub/Sub cree (`redis-updates`)
-- 2 subscriptions creees:
-  - `redis-updates-instance-1`
-  - `redis-updates-instance-2`
-- Redis Memorystore disponible
-- VPC connector Cloud Run vers le VPC Redis
-
-## IAM (compte de service Cloud Run)
-
-Le compte de service Cloud Run doit avoir:
-
-- `roles/pubsub.publisher`
-- `roles/pubsub.subscriber`
-
-Optionnel si creation auto topic/sub par le code:
-
-- `roles/pubsub.admin`
-
-## Variables d'environnement backend
-
-Variables principales:
-
-- `GCP_PROJECT_ID`
-- `TOPIC_NAME`
-- `SUBSCRIPTION_NAME`
-- `SERVER_ID`
-- `REDIS_HOST`
-- `REDIS_PORT`
-- `PUBSUB_AUTO_CREATE` (recommande `false`)
-
-## Deploiement (recommande)
+## Deploiement recommande
 
 Depuis `td-cloud/`:
 
 ```powershell
 .\deploy.ps1 `
-  -ProjectId redis-demo-cloud `
+  -ProjectId td-cloud-495410 `
   -Region europe-west1 `
-  -RedisHost 10.55.48.211 `
+  -RedisHost 10.128.148.43 `
   -RedisPort 6379 `
   -VpcConnector vpc-connector `
   -VpcEgress private-ranges-only `
-  -TimeoutSeconds 3600 `
-  -MinInstances 1 `
-  -MaxInstances 1 `
+  -ProvisionInfra `
   -AllowUnauthenticated
 ```
 
-Notes:
+Noms ressources utilises (template TD2):
+- Topic Pub/Sub: `game-events`
+- Subscriptions: `td-redis-sub-instance-1`, `td-redis-sub-instance-2`
+- Queue Cloud Tasks: `game-events-queue`
+- Bucket snapshots: `game-snapshots-<PROJECT_ID>`
 
-- `MinInstances=1` garde le listener Pub/Sub actif (meilleure stabilite temps reel).
-- `MaxInstances=1` evite les effets de repartition multi-container pour cette demo.
-
-## Test end-to-end
-
-1. Ouvre les 2 URLs Cloud Run dans 2 onglets:
-   - `https://instance-1-...run.app`
-   - `https://instance-2-...run.app`
-2. Fais `Ctrl+F5` sur les deux pages.
-3. Publie un message depuis un onglet.
-4. Verifie reception sur les deux onglets (sans reload).
-
-## Commandes de debug utiles
-
-Verifier subscriptions:
+## Tests rapides
 
 ```powershell
-gcloud pubsub subscriptions list --project=redis-demo-cloud
+$u1 = gcloud run services describe instance-1 --region=europe-west1 --format="value(status.url)"
+$u2 = gcloud run services describe instance-2 --region=europe-west1 --format="value(status.url)"
+
+Invoke-RestMethod "$u1/health"
+Invoke-RestMethod "$u2/health"
+
+Invoke-RestMethod -Method Post -Uri "$u1/publish" -ContentType "application/json" -Body '{"message":"hello"}'
+Invoke-RestMethod -Method Get -Uri "$u1/analytics" -Headers @{ "X-Admin-Key" = "td-secret-2026" }
 ```
 
-Logs Pub/Sub instance-1:
+Test complet automatique (health + snapshot + rate limit + analytics auth):
 
 ```powershell
-gcloud logging read "resource.type=cloud_run_revision AND resource.labels.service_name=instance-1 AND textPayload:Pub/Sub" --project=redis-demo-cloud --limit=30 --format="table(timestamp,textPayload)"
+cd .\td-cloud
+.\test-td2.ps1 -OpenBrowsers
 ```
 
-Logs Pub/Sub instance-2:
+Si tout est bon, le script affiche `GLOBAL PASS: True`.
 
-```powershell
-gcloud logging read "resource.type=cloud_run_revision AND resource.labels.service_name=instance-2 AND textPayload:Pub/Sub" --project=redis-demo-cloud --limit=30 --format="table(timestamp,textPayload)"
-```
+## Note /analytics
 
-## Dev local
+- `/analytics` est protege par le header `X-Admin-Key`.
+- Sans header, la route retourne `401 Unauthorized`.
+- En navigateur direct (barre URL), c'est donc normal de ne pas voir la route sans erreur.
 
-Voir `LOCAL_DEV.md`:
+## Rate limit
 
-- Option A: emulateur Pub/Sub
-- Option B: desactiver Pub/Sub (`DISABLE_PUBSUB=1`)
+- Header joueur: `X-Player-ID`
+- Limite par defaut: `5` requetes / `60s` (`RATE_LIMIT_PER_MIN`)
+- Comportement si Firestore indisponible: fail-open (requete autorisee)
 
-## Cout
 
-Pour economiser la nuit:
 
-- redeployer avec `-MinInstances 0`
-
-Avant demo/tests:
-
-- remettre `-MinInstances 1`
+By VERNIER Matthieu, BOUGHEL Lukas, GILRCHRIST Steven
